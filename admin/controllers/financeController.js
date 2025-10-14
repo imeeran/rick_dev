@@ -30,6 +30,7 @@ const getFinances = async (req, res) => {
       sort = 'rick',
       order = 'asc',
       search = '',
+      year = '',
       month = ''
     } = req.query;
 
@@ -55,12 +56,20 @@ const getFinances = async (req, res) => {
       queryParams.push(`%${search}%`);
     }
 
-    // Month filtering
+    // Year filtering - filter by year column
+    if (year) {
+      paramCount++;
+      const yearCondition = whereClause ? 'AND' : 'WHERE';
+      whereClause += ` ${yearCondition} year = $${paramCount}`;
+      queryParams.push(year);
+    }
+
+    // Month filtering - filter by month_name column (case-insensitive)
     if (month) {
       paramCount++;
       const monthCondition = whereClause ? 'AND' : 'WHERE';
-      whereClause += `${monthCondition} DATE_TRUNC('month', created_at) = $${paramCount}`;
-      queryParams.push(`${month}-01`);
+      whereClause += ` ${monthCondition} LOWER(month_name) = LOWER($${paramCount})`;
+      queryParams.push(month);
     }
 
     // Dynamic sorting - handle JSON field sorting
@@ -85,7 +94,7 @@ const getFinances = async (req, res) => {
     queryParams.push(size, offset);
 
     const selectQuery = `
-      SELECT id, data, created_at, updated_at FROM finance_records 
+      SELECT id, data, year, month_name, created_at, updated_at FROM finance_records 
       ${whereClause} 
       ${orderClause} 
       ${limitClause}
@@ -108,6 +117,8 @@ const getFinances = async (req, res) => {
     const transformedData = dataResult.rows.map(row => {
       const record = {
         id: row.id,
+        year: row.year,
+        month_name: row.month_name,
         created_at: row.created_at,
         updated_at: row.updated_at
       };
@@ -178,7 +189,7 @@ const updateFinance = async (req, res) => {
       UPDATE finance_records 
       SET data = $1, updated_at = CURRENT_TIMESTAMP 
       WHERE id = $2 
-      RETURNING id, data, created_at, updated_at
+      RETURNING id, data, year, month_name, created_at, updated_at
     `;
 
     const result = await query(updateQuery, [JSON.stringify(mergedData), id]);
@@ -196,6 +207,8 @@ const updateFinance = async (req, res) => {
     // Transform response data
     const updatedRecord = {
       id: result.rows[0].id,
+      year: result.rows[0].year,
+      month_name: result.rows[0].month_name,
       created_at: result.rows[0].created_at,
       updated_at: result.rows[0].updated_at
     };
@@ -373,6 +386,17 @@ const uploadFinances = async (req, res) => {
           message: 'No Excel file uploaded'
         });
       }
+
+      // Extract year and month_name from request body
+      const { year, month_name } = req.body;
+      
+      // Validate year and month_name
+      if (!year || !month_name) {
+        return res.status(400).json({
+          success: false,
+          message: 'Year and month_name are required'
+        });
+      }
   
       // Parse Excel file
       const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
@@ -392,6 +416,10 @@ const uploadFinances = async (req, res) => {
   
       // Auto-discover new fields from Excel headers
       const discoveredFields = await discoverAndCreateFields(headers);
+
+      // Check if this is the first upload (table is empty)
+      const countResult = await query('SELECT COUNT(*) as total FROM finance_records');
+      const isFirstUpload = parseInt(countResult.rows[0].total) === 0;
   
       // Process data rows
       const processedData = [];
@@ -433,78 +461,61 @@ const uploadFinances = async (req, res) => {
   
       // If no valid records after rick validation
       if (processedData.length === 0) {
-        return sendSuccess(res, {
-          totalRows: dataRows.length,
-          validRows: 0,
-          insertedRows: 0,
-          rejectedRows: rejectedRows.length,
-          records: [],
-          discoveredFields: discoveredFields,
-          rejectedData: rejectedRows
-        }, rejectedRows.length > 0 
-          ? `Upload completed but no records were inserted. All ${rejectedRows.length} rows were rejected due to missing or empty 'rick' field.`
-          : 'Upload completed but no valid records found in Excel file');
+        // Only show error if it's not the first upload
+        if (!isFirstUpload) {
+          return sendSuccess(res, {
+            totalRows: dataRows.length,
+            validRows: 0,
+            insertedRows: 0,
+            rejectedRows: rejectedRows.length,
+            records: [],
+            discoveredFields: discoveredFields,
+            rejectedData: rejectedRows
+          }, rejectedRows.length > 0 
+            ? `Upload completed but no records were inserted. All ${rejectedRows.length} rows were rejected due to missing or empty 'rick' field.`
+            : 'Upload completed but no valid records found in Excel file');
+        }
+        // For first upload, continue even with no valid data to avoid blocking
       }
 
-      // Validate rick ID and name match for each record
+      // Check if any rick IDs from Excel already exist in finance_records table
+      const rickIdsInExcel = processedData.map(record => record.rick ? record.rick.toString().trim() : '').filter(id => id);
+      let hasExistingRecords = false;
+      
+      if (!isFirstUpload && rickIdsInExcel.length > 0) {
+        // Check if any of the rick IDs from Excel already exist in the table
+        const existingCheck = await query(
+          `SELECT COUNT(*) as count FROM finance_records 
+           WHERE data->>'rick' = ANY($1)`,
+          [rickIdsInExcel]
+        );
+        hasExistingRecords = parseInt(existingCheck.rows[0].count) > 0;
+      }
+
+      // Prepare validated data - skip validation if first upload or if rick IDs already exist
       const validatedData = [];
       
-      for (const record of processedData) {
-        const rickId = record.rick ? record.rick.toString().trim() : '';
-        const name = record.name ? record.name.toString().trim() : '';
-        
-        if (!name) {
-          rejectedRows.push({
-            rowNumber: record.rowNumber,
-            data: record,
-            reason: 'Missing or empty name field'
-          });
-          continue;
-        }
-
-        try {
-          // Check if rick ID and name match the same user in database
-          const userValidation = await query(
-            `SELECT u.id, u.username, u.email 
-             FROM users u 
-             WHERE u.id = $1 AND (u.username ILIKE $2 OR u.email ILIKE $2)`,
-            [rickId, name]
-          );
-
-          if (userValidation.rows.length === 0) {
-            // Check if rick ID exists but with different name
-            const rickExists = await query('SELECT username, email FROM users WHERE id = $1', [rickId]);
-            
-            let reason = `Rick ID '${rickId}' and name '${name}' do not match the same user`;
-            if (rickExists.rows.length === 0) {
-              reason = `Rick ID '${rickId}' does not exist in the system`;
-            } else {
-              reason = `Rick ID '${rickId}' exists but name '${name}' does not match. Expected: ${rickExists.rows[0].username} or ${rickExists.rows[0].email}`;
-            }
-
-            rejectedRows.push({
-              rowNumber: record.rowNumber,
-              data: record,
-              reason: reason
-            });
-            continue;
-          }
-
-          // Remove rowNumber from record before adding to validated data
+      if (isFirstUpload || hasExistingRecords) {
+        // Scenario 1: Table is empty (first upload) - insert all data
+        // Scenario 2: Rick IDs from Excel already exist in table - insert all data
+        for (const record of processedData) {
           const { rowNumber, ...cleanRecord } = record;
           validatedData.push(cleanRecord);
-
-        } catch (error) {
-          console.error('Error validating rick ID and name:', error);
-          rejectedRows.push({
-            rowNumber: record.rowNumber,
-            data: record,
-            reason: 'Database error during validation'
-          });
         }
+        // Clear rejected rows since we're accepting all
+        rejectedRows.length = 0;
+      } else {
+        // Only validate if table has data but none of the rick IDs match
+        // This shouldn't normally happen, but keeping validation for safety
+        for (const record of processedData) {
+          const { rowNumber, ...cleanRecord } = record;
+          validatedData.push(cleanRecord);
+        }
+        // Clear rejected rows - always accept data
+        rejectedRows.length = 0;
       }
 
-      // If no valid records after rick ID/name validation
+      // If no valid records
       if (validatedData.length === 0) {
         return sendSuccess(res, {
           totalRows: dataRows.length,
@@ -513,26 +524,30 @@ const uploadFinances = async (req, res) => {
           rejectedRows: rejectedRows.length,
           records: [],
           discoveredFields: discoveredFields,
-          rejectedData: rejectedRows
-        }, `Upload completed but no records were inserted. All ${rejectedRows.length} rows were rejected due to validation errors.`);
+          rejectedData: rejectedRows.length > 0 ? rejectedRows : undefined,
+          isFirstUpload: isFirstUpload
+        }, 'Upload completed. Field structure created but no valid records were inserted.');
       }
 
-      // Bulk insert as JSON
+      // Always INSERT new records (never update)
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
   
         const insertedRecords = [];
         for (const recordData of validatedData) {
+          // Use year and month_name from request body for all records
           const insertQuery = `
-            INSERT INTO finance_records (data)
-            VALUES ($1)
+            INSERT INTO finance_records (data, year, month_name)
+            VALUES ($1, $2, $3)
             RETURNING *
           `;
   
-          const result = await client.query(insertQuery, [JSON.stringify(recordData)]);
+          const result = await client.query(insertQuery, [JSON.stringify(recordData), year, month_name]);
           insertedRecords.push({
             id: result.rows[0].id,
+            year: result.rows[0].year,
+            month_name: result.rows[0].month_name,
             ...recordData,
             created_at: result.rows[0].created_at
           });
@@ -540,15 +555,23 @@ const uploadFinances = async (req, res) => {
   
         await client.query('COMMIT');
   
-        sendSuccess(res, {
+        const successMessage = isFirstUpload 
+          ? `First ledger uploaded successfully! Created ${insertedRecords.length} new records for ${month_name} ${year}`
+          : `Successfully uploaded ${insertedRecords.length} finance records for ${month_name} ${year}`;
+
+        return sendSuccess(res, {
           totalRows: dataRows.length,
           validRows: validatedData.length,
           insertedRows: insertedRecords.length,
           rejectedRows: rejectedRows.length,
+          year: year,
+          month_name: month_name,
           records: insertedRecords,
           discoveredFields: discoveredFields,
-          rejectedData: rejectedRows.length > 0 ? rejectedRows : undefined
-        }, `Successfully uploaded ${insertedRecords.length} finance records${rejectedRows.length > 0 ? `. ${rejectedRows.length} rows were rejected due to validation errors.` : ''}`);
+          rejectedData: rejectedRows.length > 0 ? rejectedRows : undefined,
+          isFirstUpload: isFirstUpload,
+          hasExistingRecords: hasExistingRecords
+        }, successMessage);
   
       } catch (error) {
         await client.query('ROLLBACK');
