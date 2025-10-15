@@ -1,5 +1,5 @@
 const { query, pool } = require('../../shared/database/connection');
-const { sendSuccess, sendError, sendNotFound, sendValidationError } = require('../../shared/utils/response');
+const { sendSuccess, sendError, sendNotFound } = require('../../shared/utils/response');
 const multer = require('multer');
 const XLSX = require('xlsx');
 
@@ -7,18 +7,57 @@ const XLSX = require('xlsx');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// Helper function to get default values based on field type
-const getDefaultValue = (fieldType) => {
-  switch (fieldType) {
-    case 'currency':
-    case 'number':
-      return 0;
-    case 'date':
-      return null;
-    case 'text':
-    default:
-      return '';
+// Helper function to format field label from key
+const formatFieldLabel = (key) => {
+  // Special cases for known fields
+  const labelMap = {
+    'rick': 'S No.',
+    'rick_no': 'Rick',
+    'plate': 'Plate',
+    'name': 'Name',
+    'employee': 'Employee',
+    'daman': 'Daman',
+    'darb': 'DARB',
+    'fine': 'Fine',
+    'salik': 'Salik',
+    'pos': 'POS',
+    'advance': 'Advance',
+    'adnoc': 'ADNOC',
+    'trip': 'Trip',
+    'other_exp': 'Other Exp',
+    'uber_30_days': 'Uber 30 Days',
+    'careem_30_days': 'Careem 30 Days',
+    'yango_30': 'Yango 30',
+    'total_salary': 'Total Salary'
+  };
+  
+  if (labelMap[key]) {
+    return labelMap[key];
   }
+  
+  // Convert snake_case or camelCase to Title Case
+  // First replace underscores with spaces
+  let formatted = key.replace(/_/g, ' ');
+  
+  // Only add spaces before capitals if NOT all uppercase (handle camelCase properly)
+  // This prevents "CAREEM" from becoming "C A R E E M"
+  if (formatted !== formatted.toUpperCase()) {
+    // Add space before capital letters that follow lowercase letters (camelCase)
+    formatted = formatted.replace(/([a-z])([A-Z])/g, '$1 $2');
+  }
+  
+  // Convert to Title Case
+  return formatted
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ')
+    .trim();
+};
+
+// Helper function to determine if field should be highlighted
+const shouldHighlightField = (key) => {
+  const highlightFields = ['total_salary', 'uber_30_days', 'careem_30_days', 'yango_30'];
+  return highlightFields.includes(key);
 };
 
 // GET /api/admin/finances - Get finance records with dynamic fields
@@ -34,77 +73,78 @@ const getFinances = async (req, res) => {
       month = ''
     } = req.query;
 
-    // Get current field metadata
-    const fieldsQuery = `
-      SELECT field_key, field_label, field_type, sortable, highlight, hidden, display_order, category
-      FROM field_metadata 
-      WHERE is_active = true
-      ORDER BY display_order ASC
-    `;
-    const fieldsResult = await query(fieldsQuery);
-    const fields = fieldsResult.rows;
+    // Pagination setup
+    const offset = page * size;
+    const limit = parseInt(size);
+    const sortOrder = order.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
-    // Build dynamic query based on JSON fields
+    // WHERE clause setup
+    const queryParams = [];
     let whereClause = '';
-    let queryParams = [];
     let paramCount = 0;
 
-    // Search in name field (or any text field)
     if (search) {
       paramCount++;
-      whereClause += `WHERE data->>'name' ILIKE $${paramCount}`;
+      whereClause += `WHERE data::text ILIKE $${paramCount}`;
       queryParams.push(`%${search}%`);
     }
 
-    // Year filtering - filter by year column
     if (year) {
       paramCount++;
-      const yearCondition = whereClause ? 'AND' : 'WHERE';
-      whereClause += ` ${yearCondition} year = $${paramCount}`;
+      const condition = whereClause ? 'AND' : 'WHERE';
+      whereClause += ` ${condition} year = $${paramCount}`;
       queryParams.push(year);
     }
 
-    // Month filtering - filter by month_name column (case-insensitive)
     if (month) {
       paramCount++;
-      const monthCondition = whereClause ? 'AND' : 'WHERE';
-      whereClause += ` ${monthCondition} LOWER(month_name) = LOWER($${paramCount})`;
+      const condition = whereClause ? 'AND' : 'WHERE';
+      whereClause += ` ${condition} LOWER(month_name) = LOWER($${paramCount})`;
       queryParams.push(month);
     }
 
-    // Dynamic sorting - handle JSON field sorting
+    // Order by Excel row order by default, or by specified field if sorting is requested
     let orderClause = '';
-    if (sort && fields.some(f => f.field_key === sort && f.sortable)) {
-      const fieldType = fields.find(f => f.field_key === sort)?.field_type || 'text';
-      const sortOrder = order.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-      
-      if (['currency', 'number'].includes(fieldType)) {
-        orderClause = `ORDER BY (data->>'${sort}')::numeric ${sortOrder}`;
+    if (sort && sort !== 'rick') {
+      // User explicitly requested sorting by a specific field
+      if (sort === 'created_at' || sort === 'updated_at' || sort === 'id') {
+        orderClause = `ORDER BY ${sort} ${sortOrder}`;
       } else {
-        orderClause = `ORDER BY data->>'${sort}' ${sortOrder}`;
+        // Try to sort as numeric if possible, otherwise sort as text
+        orderClause = `ORDER BY 
+          CASE 
+            WHEN data->>'${sort}' ~ '^[0-9]+\\.?[0-9]*$' 
+            THEN (data->>'${sort}')::numeric 
+            ELSE NULL 
+          END ${sortOrder} NULLS LAST,
+          data->>'${sort}' ${sortOrder}`;
       }
     } else {
-      orderClause = `ORDER BY created_at DESC`;
+      // Default: maintain Excel row order using _excel_row field, fallback to id
+      orderClause = `ORDER BY COALESCE((data->>'_excel_row')::integer, id) ASC`;
     }
 
     // Pagination
-    const offset = page * size;
     paramCount += 2;
     const limitClause = `LIMIT $${paramCount - 1} OFFSET $${paramCount}`;
-    queryParams.push(size, offset);
+    queryParams.push(limit, offset);
 
+    // Build query
     const selectQuery = `
-      SELECT id, data, year, month_name, created_at, updated_at FROM finance_records 
-      ${whereClause} 
-      ${orderClause} 
+      SELECT id, data, year, month_name, created_at, updated_at
+      FROM finance_records
+      ${whereClause}
+      ${orderClause}
       ${limitClause}
     `;
 
     const countQuery = `
-      SELECT COUNT(*) as total FROM finance_records 
+      SELECT COUNT(*) AS total
+      FROM finance_records
       ${whereClause}
     `;
 
+    // Execute queries
     const [dataResult, countResult] = await Promise.all([
       query(selectQuery, queryParams),
       query(countQuery, queryParams.slice(0, -2))
@@ -113,25 +153,90 @@ const getFinances = async (req, res) => {
     const total = parseInt(countResult.rows[0].total);
     const totalPages = Math.ceil(total / size);
 
-    // Transform data to include all fields with proper structure
-    const transformedData = dataResult.rows.map(row => {
-      const record = {
-        id: row.id,
-        year: row.year,
-        month_name: row.month_name,
-        created_at: row.created_at,
-        updated_at: row.updated_at
-      };
-      
-      // Add all configured fields to the record
-      fields.forEach(field => {
-        record[field.field_key] = row.data[field.field_key] || getDefaultValue(field.field_type);
+    // Extract column order from first record (stored during upload)
+    let columnOrder = [];
+    if (dataResult.rows.length > 0) {
+      const firstRecord = dataResult.rows[0].data || {};
+      columnOrder = firstRecord._column_order || Object.keys(firstRecord);
+    }
+
+    // Extract all unique keys from all records and collect sample values
+    const keyStats = {};
+    dataResult.rows.forEach(row => {
+      Object.entries(row.data || {}).forEach(([key, value]) => {
+        // Skip internal fields
+        if (key === '_excel_row' || key === '_column_order') {
+          return;
+        }
+        
+        if (!keyStats[key]) {
+          keyStats[key] = { samples: [] };
+        }
+        if (keyStats[key].samples.length < 5 && value != null && value !== '') {
+          keyStats[key].samples.push(value);
+        }
       });
-      
-      return record;
     });
 
+    // Generate field configurations dynamically
+    const fields = Object.entries(keyStats).map(([key, stats]) => {
+      // Infer type from sample values
+      let fieldType = 'text';
+      const samples = stats.samples;
+      
+      if (samples.length > 0) {
+        // Check if all non-empty samples are numeric
+        const numericSamples = samples.filter(v => {
+          const num = parseFloat(v);
+          return !isNaN(num) && typeof v === 'number';
+        });
+        
+        if (numericSamples.length > 0 && numericSamples.length === samples.length) {
+          // Check if values have decimal places
+          const hasDecimals = numericSamples.some(v => v % 1 !== 0);
+          fieldType = hasDecimals ? 'currency' : 'number';
+        }
+      }
+
+      return {
+        key: key,
+        label: formatFieldLabel(key),
+        type: fieldType,
+        sortable: true,
+        highlight: shouldHighlightField(key),
+        hidden: false,
+        displayOrder: 0
+      };
+    });
+
+    // Sort fields to match Excel column order (using stored _column_order)
+    fields.sort((a, b) => {
+      const aIndex = columnOrder.indexOf(a.key);
+      const bIndex = columnOrder.indexOf(b.key);
+      
+      // If both found, sort by their position in Excel
+      if (aIndex !== -1 && bIndex !== -1) {
+        return aIndex - bIndex;
+      }
+      // If only one found, prioritize it
+      if (aIndex !== -1) return -1;
+      if (bIndex !== -1) return 1;
+      // If neither found, alphabetical
+      return a.key.localeCompare(b.key);
+    });
+
+    // Transform data - flatten JSONB into top-level properties (exclude internal fields)
+    const transformedData = dataResult.rows.map(row => {
+      const { _excel_row, _column_order, ...dataWithoutInternal } = row.data || {};
+      return {
+        id: row.id,
+        ...dataWithoutInternal
+      };
+    });
+
+    // Response
     sendSuccess(res, {
+      fields: fields,
       data: transformedData,
       pagination: {
         page: parseInt(page),
@@ -139,18 +244,8 @@ const getFinances = async (req, res) => {
         totalPages,
         total,
         startIndex: offset,
-        endIndex: Math.min(offset + size - 1, total - 1)
-      },
-      fields: fields.map(field => ({
-        key: field.field_key,
-        label: field.field_label,
-        type: field.field_type,
-        sortable: field.sortable,
-        highlight: field.highlight,
-        hidden: field.hidden,
-        displayOrder: field.display_order,
-        category: field.category
-      }))
+        endIndex: Math.min(offset + transformedData.length - 1, total - 1)
+      }
     }, 'Finance records retrieved successfully');
 
   } catch (error) {
@@ -170,9 +265,18 @@ const updateFinance = async (req, res) => {
       return sendError(res, 'Invalid finance record ID', 400);
     }
 
+    // Remove protected fields from update data if present
+    delete updateData.id;
+    delete updateData.created_at;
+    delete updateData.updated_at;
+    delete updateData.year;
+    delete updateData.month_name;
+    delete updateData._excel_row;      // Preserve original Excel row position
+    delete updateData._column_order;   // Preserve original Excel column order
+
     // Check if record exists
     const existingRecord = await query(
-      'SELECT id, data FROM finance_records WHERE id = $1',
+      'SELECT id, data, year, month_name FROM finance_records WHERE id = $1',
       [id]
     );
 
@@ -180,7 +284,7 @@ const updateFinance = async (req, res) => {
       return sendNotFound(res, 'Finance record');
     }
 
-    // Merge existing data with update data
+    // Merge existing data with update data (preserves _excel_row from existing)
     const currentData = existingRecord.rows[0].data;
     const mergedData = { ...currentData, ...updateData };
 
@@ -194,29 +298,12 @@ const updateFinance = async (req, res) => {
 
     const result = await query(updateQuery, [JSON.stringify(mergedData), id]);
 
-    // Get field metadata for response formatting
-    const fieldsQuery = `
-      SELECT field_key, field_label, field_type, sortable, highlight, hidden, display_order, category
-      FROM field_metadata 
-      WHERE is_active = true
-      ORDER BY display_order ASC
-    `;
-    const fieldsResult = await query(fieldsQuery);
-    const fields = fieldsResult.rows;
-
-    // Transform response data
+    // Transform response data - flatten JSONB (exclude internal fields)
+    const { _excel_row, _column_order, ...dataWithoutInternal } = result.rows[0].data || {};
     const updatedRecord = {
       id: result.rows[0].id,
-      year: result.rows[0].year,
-      month_name: result.rows[0].month_name,
-      created_at: result.rows[0].created_at,
-      updated_at: result.rows[0].updated_at
+      ...dataWithoutInternal
     };
-
-    // Add all configured fields to the record
-    fields.forEach(field => {
-      updatedRecord[field.field_key] = result.rows[0].data[field.field_key] || getDefaultValue(field.field_type);
-    });
 
     sendSuccess(res, updatedRecord, 'Finance record updated successfully');
 
@@ -311,7 +398,7 @@ const bulkDeleteFinances = async (req, res) => {
   }
 };
 
-// DELETE /api/admin/finances/fields/:fieldname - Delete field metadata
+// DELETE /api/admin/finances/fields/:fieldname - Delete field from all records
 const deleteField = async (req, res) => {
   try {
     const { fieldname } = req.params;
@@ -323,17 +410,11 @@ const deleteField = async (req, res) => {
 
     const fieldKey = fieldname.trim();
 
-    // Check if field exists
-    const existingField = await query(
-      'SELECT id, field_key, field_label FROM field_metadata WHERE field_key = $1',
-      [fieldKey]
-    );
-
-    if (existingField.rows.length === 0) {
-      return sendNotFound(res, `Field '${fieldKey}'`);
+    // Prevent deletion of critical fields
+    const protectedFields = ['id', 'rick', 'rick_no', 'name'];
+    if (protectedFields.includes(fieldKey)) {
+      return sendError(res, `Cannot delete protected field '${fieldKey}'`, 400);
     }
-
-    const field = existingField.rows[0];
 
     // Check if field is being used in any finance records
     const usageCheck = await query(
@@ -345,31 +426,28 @@ const deleteField = async (req, res) => {
 
     const usageCount = parseInt(usageCheck.rows[0].usage_count);
 
-    // Delete the field metadata
-    const deleteQuery = 'DELETE FROM field_metadata WHERE field_key = $1 RETURNING *';
-    const result = await query(deleteQuery, [fieldKey]);
-
-    // If field was being used, also remove it from all finance records
-    if (usageCount > 0) {
-      const updateRecordsQuery = `
-        UPDATE finance_records 
-        SET data = data - $1,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE data ? $1
-      `;
-      await query(updateRecordsQuery, [fieldKey]);
+    if (usageCount === 0) {
+      return sendSuccess(res, {
+        deletedField: fieldKey,
+        usageCount: 0,
+        recordsUpdated: 0
+      }, `Field '${fieldKey}' was not found in any records`);
     }
 
+    // Remove the field from all finance records
+    const updateRecordsQuery = `
+      UPDATE finance_records 
+      SET data = data - $1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE data ? $1
+    `;
+    await query(updateRecordsQuery, [fieldKey]);
+
     sendSuccess(res, {
-      deletedField: {
-        id: result.rows[0].id,
-        field_key: result.rows[0].field_key,
-        field_label: result.rows[0].field_label,
-        field_type: result.rows[0].field_type
-      },
+      deletedField: fieldKey,
       usageCount: usageCount,
-      recordsUpdated: usageCount > 0 ? usageCount : 0
-    }, `Field '${fieldKey}' deleted successfully${usageCount > 0 ? ` and removed from ${usageCount} record(s)` : ''}`);
+      recordsUpdated: usageCount
+    }, `Field '${fieldKey}' deleted successfully and removed from ${usageCount} record(s)`);
 
   } catch (error) {
     console.error('Error deleting field:', error);
@@ -379,296 +457,196 @@ const deleteField = async (req, res) => {
 
 // POST /api/admin/finances/upload - Upload Excel file
 const uploadFinances = async (req, res) => {
+  try {
+    // Validate required inputs
+    if (!req.file) {
+      return sendError(res, 'No Excel file uploaded', 400);
+    }
+
+    const { year, month_name } = req.body;
+    
+    if (!year || !month_name) {
+      return sendError(res, 'Year and month_name are required', 400);
+    }
+
+    // Parse Excel file into JSON array (each row becomes an object)
+    const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+    const jsonData = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+// console.log(jsonData);
+    // Validate data is not empty
+    if (jsonData.length === 0) {
+      return sendError(res, 'Excel file is empty', 400);
+    }
+
+    // Extract column order from first row (Excel column order)
+    const columnOrder = jsonData.length > 0 ? Object.keys(jsonData[0]) : [];
+
+    // Insert each row as a separate record in the same order as Excel
+    const client = await pool.connect();
     try {
-      if (!req.file) {
-        return res.status(400).json({
-          success: false,
-          message: 'No Excel file uploaded'
-        });
+      await client.query('BEGIN');
+
+      const insertQuery = `
+        INSERT INTO finance_records (data, year, month_name)
+        VALUES ($1, $2, $3)
+        RETURNING id
+      `;
+
+      const insertedIds = [];
+      // Loop through jsonData array in order - maintains Excel row order
+      for (let i = 0; i < jsonData.length; i++) {
+        const rowData = jsonData[i];
+        
+        // Add Excel row number and column order to the data
+        const dataWithMetadata = {
+          ...rowData,
+          _excel_row: i + 1,        // Track original Excel row position
+          _column_order: columnOrder // Track original Excel column order
+        };
+        
+        const result = await client.query(insertQuery, [
+          JSON.stringify(dataWithMetadata), 
+          year, 
+          month_name
+        ]);
+        insertedIds.push(result.rows[0].id);
       }
 
-      // Extract year and month_name from request body
-      const { year, month_name } = req.body;
-      
-      // Validate year and month_name
-      if (!year || !month_name) {
-        return res.status(400).json({
-          success: false,
-          message: 'Year and month_name are required'
-        });
-      }
-  
-      // Parse Excel file
-      const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
-      const sheetName = workbook.SheetNames[0];
-      const worksheet = workbook.Sheets[sheetName];
-      const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-  
-      if (jsonData.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'Excel file is empty'
-        });
-      }
-  
-      const headers = jsonData[0];
-      const dataRows = jsonData.slice(1);
-  
-      // Auto-discover new fields from Excel headers
-      const discoveredFields = await discoverAndCreateFields(headers);
+      await client.query('COMMIT');
 
-      // Check if this is the first upload (table is empty)
-      const countResult = await query('SELECT COUNT(*) as total FROM finance_records');
-      const isFirstUpload = parseInt(countResult.rows[0].total) === 0;
-  
-      // Process data rows
-      const processedData = [];
-      const rejectedRows = [];
-      
-      dataRows.forEach((row, rowIndex) => {
-        // Skip empty rows
-        if (row.every(cell => cell === null || cell === undefined || cell === '')) {
-          return;
-        }
-  
-        const recordData = {};
-        headers.forEach((header, index) => {
-          if (header) {
-            const fieldKey = sanitizeFieldKey(header.toString());
-            const cellValue = row[index] || '';
-            recordData[fieldKey] = processCellValue(cellValue);
-          }
-        });
-  
-        // Only process records with some meaningful data
-        if (Object.keys(recordData).length > 0) {
-          // Check if 'rick' field is available and has a value
-          if (!recordData.rick || recordData.rick.toString().trim() === '') {
-            rejectedRows.push({
-              rowNumber: rowIndex + 2, // +2 because: +1 for 0-based index, +1 for header row
-              data: recordData,
-              reason: 'Missing or empty rick field'
-            });
-          } else {
-            // Add to processed data for further validation
-            processedData.push({
-              ...recordData,
-              rowNumber: rowIndex + 2
-            });
-          }
-        }
-      });
-  
-      // If no valid records after rick validation
-      if (processedData.length === 0) {
-        // Only show error if it's not the first upload
-        if (!isFirstUpload) {
-          return sendSuccess(res, {
-            totalRows: dataRows.length,
-            validRows: 0,
-            insertedRows: 0,
-            rejectedRows: rejectedRows.length,
-            records: [],
-            discoveredFields: discoveredFields,
-            rejectedData: rejectedRows
-          }, rejectedRows.length > 0 
-            ? `Upload completed but no records were inserted. All ${rejectedRows.length} rows were rejected due to missing or empty 'rick' field.`
-            : 'Upload completed but no valid records found in Excel file');
-        }
-        // For first upload, continue even with no valid data to avoid blocking
-      }
+      // Return success response
+      return sendSuccess(res, {
+        success: true,
+        message: 'Finance data uploaded successfully',
+        month: month_name,
+        year: parseInt(year),
+        totalRows: jsonData.length,
+        insertedIds: insertedIds,
+        firstId: insertedIds[0],
+        lastId: insertedIds[insertedIds.length - 1]
+      }, `Successfully uploaded ${jsonData.length} finance records`);
 
-      // Check if any rick IDs from Excel already exist in finance_records table
-      const rickIdsInExcel = processedData.map(record => record.rick ? record.rick.toString().trim() : '').filter(id => id);
-      let hasExistingRecords = false;
-      
-      if (!isFirstUpload && rickIdsInExcel.length > 0) {
-        // Check if any of the rick IDs from Excel already exist in the table
-        const existingCheck = await query(
-          `SELECT COUNT(*) as count FROM finance_records 
-           WHERE data->>'rick' = ANY($1)`,
-          [rickIdsInExcel]
-        );
-        hasExistingRecords = parseInt(existingCheck.rows[0].count) > 0;
-      }
-
-      // Prepare validated data - skip validation if first upload or if rick IDs already exist
-      const validatedData = [];
-      
-      if (isFirstUpload || hasExistingRecords) {
-        // Scenario 1: Table is empty (first upload) - insert all data
-        // Scenario 2: Rick IDs from Excel already exist in table - insert all data
-        for (const record of processedData) {
-          const { rowNumber, ...cleanRecord } = record;
-          validatedData.push(cleanRecord);
-        }
-        // Clear rejected rows since we're accepting all
-        rejectedRows.length = 0;
-      } else {
-        // Only validate if table has data but none of the rick IDs match
-        // This shouldn't normally happen, but keeping validation for safety
-        for (const record of processedData) {
-          const { rowNumber, ...cleanRecord } = record;
-          validatedData.push(cleanRecord);
-        }
-        // Clear rejected rows - always accept data
-        rejectedRows.length = 0;
-      }
-
-      // If no valid records
-      if (validatedData.length === 0) {
-        return sendSuccess(res, {
-          totalRows: dataRows.length,
-          validRows: 0,
-          insertedRows: 0,
-          rejectedRows: rejectedRows.length,
-          records: [],
-          discoveredFields: discoveredFields,
-          rejectedData: rejectedRows.length > 0 ? rejectedRows : undefined,
-          isFirstUpload: isFirstUpload
-        }, 'Upload completed. Field structure created but no valid records were inserted.');
-      }
-
-      // Always INSERT new records (never update)
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-  
-        const insertedRecords = [];
-        for (const recordData of validatedData) {
-          // Use year and month_name from request body for all records
-          const insertQuery = `
-            INSERT INTO finance_records (data, year, month_name)
-            VALUES ($1, $2, $3)
-            RETURNING *
-          `;
-  
-          const result = await client.query(insertQuery, [JSON.stringify(recordData), year, month_name]);
-          insertedRecords.push({
-            id: result.rows[0].id,
-            year: result.rows[0].year,
-            month_name: result.rows[0].month_name,
-            ...recordData,
-            created_at: result.rows[0].created_at
-          });
-        }
-  
-        await client.query('COMMIT');
-  
-        const successMessage = isFirstUpload 
-          ? `First ledger uploaded successfully! Created ${insertedRecords.length} new records for ${month_name} ${year}`
-          : `Successfully uploaded ${insertedRecords.length} finance records for ${month_name} ${year}`;
-
-        return sendSuccess(res, {
-          totalRows: dataRows.length,
-          validRows: validatedData.length,
-          insertedRows: insertedRecords.length,
-          rejectedRows: rejectedRows.length,
-          year: year,
-          month_name: month_name,
-          records: insertedRecords,
-          discoveredFields: discoveredFields,
-          rejectedData: rejectedRows.length > 0 ? rejectedRows : undefined,
-          isFirstUpload: isFirstUpload,
-          hasExistingRecords: hasExistingRecords
-        }, successMessage);
-  
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
-      } finally {
-        client.release();
-      }
-  
     } catch (error) {
-      console.error('Error uploading Excel file:', error);
-      sendError(res, 'Failed to upload Excel file', 500, error);
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
+
+  } catch (error) {
+    console.error('Error uploading Excel file:', error);
+    sendError(res, 'Failed to upload Excel file', 500, error);
+  }
 };
 
-// Auto-discover fields from Excel headers
-const discoverAndCreateFields = async (headers) => {
-const discoveredFields = [];
+// PUT /api/admin/finances/upload - Update Excel file for existing month
+const updateFinances = async (req, res) => {
+  try {
+    // Validate required inputs
+    if (!req.file) {
+      return sendError(res, 'No Excel file uploaded', 400);
+    }
 
-for (const header of headers) {
-    if (header) {
-    const fieldKey = sanitizeFieldKey(header.toString());
-    const fieldLabel = header.toString().trim();
+    const { year, month_name } = req.body;
     
-    // Check if field already exists
-    const existingField = await pool.query(
-        'SELECT field_key FROM field_metadata WHERE field_key = $1',
-        [fieldKey]
+    if (!year || !month_name) {
+      return sendError(res, 'Year and month_name are required', 400);
+    }
+
+    // Parse Excel file into JSON array (each row becomes an object)
+    const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+    const jsonData = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+
+    // Validate data is not empty
+    if (jsonData.length === 0) {
+      return sendError(res, 'Excel file is empty', 400);
+    }
+
+    // Extract column order from first row (Excel column order)
+    const columnOrder = jsonData.length > 0 ? Object.keys(jsonData[0]) : [];
+
+    // Check if records exist for this month/year
+    const existingRecords = await query(
+      'SELECT COUNT(*) as count FROM finance_records WHERE year = $1 AND month_name = $2',
+      [year, month_name]
     );
-    
-    if (existingField.rows.length === 0) {
-        // Auto-detect field type based on name
-        const fieldType = detectFieldType(fieldLabel);
-        
-        // Insert new field
-        await pool.query(`
-        INSERT INTO field_metadata (field_key, field_label, field_type, display_order)
-        VALUES ($1, $2, $3, (SELECT COALESCE(MAX(display_order), 0) + 1 FROM field_metadata))
-        `, [fieldKey, fieldLabel, fieldType]);
-        
-        discoveredFields.push({
-        field_key: fieldKey,
-        field_label: fieldLabel,
-        field_type: fieldType
-        });
+
+    const recordCount = parseInt(existingRecords.rows[0].count);
+    if (recordCount === 0) {
+      return sendError(res, `No existing records found for ${month_name} ${year}. Use POST /upload to create new records.`, 404);
     }
+
+    // Update existing records for this month/year
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // First, delete all existing records for this month/year
+      const deleteQuery = `
+        DELETE FROM finance_records 
+        WHERE year = $1 AND month_name = $2
+        RETURNING id
+      `;
+      const deletedResult = await client.query(deleteQuery, [year, month_name]);
+      const deletedIds = deletedResult.rows.map(row => row.id);
+
+      // Insert new records with same Excel order
+      const insertQuery = `
+        INSERT INTO finance_records (data, year, month_name)
+        VALUES ($1, $2, $3)
+        RETURNING id
+      `;
+
+      const insertedIds = [];
+      // Loop through jsonData array in order - maintains Excel row order
+      for (let i = 0; i < jsonData.length; i++) {
+        const rowData = jsonData[i];
+        
+        // Add Excel row number and column order to the data
+        const dataWithMetadata = {
+          ...rowData,
+          _excel_row: i + 1,        // Track original Excel row position
+          _column_order: columnOrder // Track original Excel column order
+        };
+        
+        const result = await client.query(insertQuery, [
+          JSON.stringify(dataWithMetadata), 
+          year, 
+          month_name
+        ]);
+        insertedIds.push(result.rows[0].id);
+      }
+
+      await client.query('COMMIT');
+
+      // Return success response
+      return sendSuccess(res, {
+        success: true,
+        message: 'Finance data updated successfully',
+        month: month_name,
+        year: parseInt(year),
+        totalRows: jsonData.length,
+        deletedCount: deletedIds.length,
+        insertedCount: insertedIds.length,
+        deletedIds: deletedIds,
+        insertedIds: insertedIds,
+        firstId: insertedIds[0],
+        lastId: insertedIds[insertedIds.length - 1]
+      }, `Successfully updated ${jsonData.length} finance records for ${month_name} ${year}`);
+
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
     }
-}
 
-return discoveredFields;
-};
-
-// Sanitize field key for database
-const sanitizeFieldKey = (header) => {
-return header
-    .toLowerCase()
-    .replace(/[^a-z0-9_]/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^_|_$/g, '');
-};
-
-// Auto-detect field type based on field name
-const detectFieldType = (fieldLabel) => {
-const label = fieldLabel.toLowerCase();
-
-if (label.includes('salary') || label.includes('amount') || label.includes('price') || 
-    label.includes('cost') || label.includes('fee') || label.includes('daman') ||
-    label.includes('darb') || label.includes('fine') || label.includes('salik') ||
-    label.includes('pos') || label.includes('advance') || label.includes('adnoc') ||
-    label.includes('trip') || label.includes('uber') || label.includes('careem') ||
-    label.includes('yango') || label.includes('exp')) {
-    return 'currency';
-}
-
-if (label.includes('date') || label.includes('time')) {
-    return 'date';
-}
-
-if (label.includes('count') || label.includes('number') || label.includes('qty') ||
-    label.includes('quantity')) {
-    return 'number';
-}
-
-return 'text';
-};
-
-// Process cell value
-const processCellValue = (cellValue) => {
-if (cellValue === null || cellValue === undefined || cellValue === '') {
-    return '';
-}
-
-// Try to parse as number first
-if (!isNaN(cellValue) && !isNaN(parseFloat(cellValue))) {
-    return parseFloat(cellValue);
-}
-
-return cellValue.toString().trim();
+  } catch (error) {
+    console.error('Error updating Excel file:', error);
+    sendError(res, 'Failed to update Excel file', 500, error);
+  }
 };
 
 module.exports = {
@@ -678,5 +656,6 @@ module.exports = {
   bulkDeleteFinances,
   deleteField,
   uploadFinances,
+  updateFinances,
   upload
 };

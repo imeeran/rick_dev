@@ -24,6 +24,7 @@ router.delete('/finances/:id', requirePermission('finances.delete'), financeCont
 router.delete('/finances', requirePermission('finances.delete'), financeController.bulkDeleteFinances);
 router.delete('/finances/fields/:fieldname', requireAdmin(), financeController.deleteField);
 router.post('/finances/upload', requirePermission('finances.upload'), financeController.upload.single('excelFile'), financeController.uploadFinances);
+router.post('/finances/update', requirePermission('finances.upload'), financeController.upload.single('excelFile'), financeController.updateFinances);
 
 // Payslip routes (protected)
 router.get('/payslips', requirePermission('payslips.view'), payslipController.getAllPayslips);
