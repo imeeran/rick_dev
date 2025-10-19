@@ -1,0 +1,4 @@
+Rick Number,Plate Code,Plate Number,Mulkiya Expiry,Insurance Expiry,Chassis Number,Engine Number,Vehicle Type,Model,Status
+RICK001,A,12345,2025-12-31,2025-11-30,CHAS001XYZ123456,ENG001ABC789012,Sedan,Toyota Camry 2023,available
+RICK002,B,67890,2026-01-15,2025-12-15,CHAS002XYZ234567,ENG002ABC890123,SUV,Toyota Land Cruiser 2023,available
+RICK003,C,11111,2025-11-30,2025-10-30,CHAS003XYZ345678,ENG003ABC901234,Limousine,Mercedes S-Class 2023,available

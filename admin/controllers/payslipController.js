@@ -1,14 +1,38 @@
 const { query } = require('../../shared/database/connection');
 const { sendSuccess, sendError, sendNotFound, sendValidationError } = require('../../shared/utils/response');
 
+// Helper function to format field label from key
+const formatFieldLabel = (key) => {
+  // Convert snake_case or camelCase to Title Case
+  // First replace underscores with spaces
+  let formatted = key.replace(/_/g, ' ');
+  
+  // Only add spaces before capitals if NOT all uppercase (handle camelCase properly)
+  // This prevents "CAREEM" from becoming "C A R E E M"
+  if (formatted !== formatted.toUpperCase()) {
+    // Add space before capital letters that follow lowercase letters (camelCase)
+    formatted = formatted.replace(/([a-z])([A-Z])/g, '$1 $2');
+  }
+  
+  // Convert to Title Case
+  return formatted
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(' ');
+};
+
+// Helper function to determine if field should be highlighted
+const shouldHighlightField = (key) => {
+  const highlightFields = ['total_salary', 'uber_30_days', 'careem_30_days', 'yango_30'];
+  return highlightFields.includes(key);
+};
+
 // GET /api/admin/payslips - Get all payslips with pagination and filtering
 const getAllPayslips = async (req, res) => {
   try {
     const { 
       page = 0, 
       size = 10, 
-      sort = 'created_at', 
-      order = 'desc',
       search = '',
       month = '',
       year = '',
@@ -34,16 +58,16 @@ const getAllPayslips = async (req, res) => {
       paramCount++;
     }
 
-    // Month filtering
+    // Month filtering - using month_name column
     if (month) {
-      whereClause += ` AND data->>'month' = $${paramCount}`;
+      whereClause += ` AND month_name = $${paramCount}`;
       params.push(month);
       paramCount++;
     }
 
-    // Year filtering
+    // Year filtering - using year column
     if (year) {
-      whereClause += ` AND data->>'year' = $${paramCount}`;
+      whereClause += ` AND year = $${paramCount}`;
       params.push(year);
       paramCount++;
     }
@@ -67,32 +91,136 @@ const getAllPayslips = async (req, res) => {
     const countResult = await query(countQuery, params);
     const total = parseInt(countResult.rows[0].count);
 
+    // No ordering - display data exactly as it appears in database
+    let orderClause = '';
+
     // Get payslips with pagination
     const payslipsQuery = `
       SELECT 
         id,
         data,
+        month_name,
+        year,
         created_at,
         updated_at
       FROM payslips
       ${whereClause}
-      ORDER BY ${sort} ${order.toUpperCase()}
+      ${orderClause}
       LIMIT $${paramCount} OFFSET $${paramCount + 1}
     `;
 
     params.push(size, offset);
     const payslipsResult = await query(payslipsQuery, params);
 
+    // Extract column order from first record (similar to finance controller)
+    let columnOrder = [];
+    if (payslipsResult.rows.length > 0) {
+      const firstRecord = payslipsResult.rows[0].data || {};
+      columnOrder = Object.keys(firstRecord);
+    }
+
+    // Extract all unique keys from all records and collect sample values
+    const keyStats = {};
+    payslipsResult.rows.forEach(row => {
+      Object.entries(row.data || {}).forEach(([key, value]) => {
+        if (!keyStats[key]) {
+          keyStats[key] = { samples: [] };
+        }
+        if (keyStats[key].samples.length < 5 && value != null && value !== '') {
+          keyStats[key].samples.push(value);
+        }
+      });
+    });
+
+    // Generate field configurations dynamically
+    const fields = Object.entries(keyStats).map(([key, stats]) => {
+      // Infer type from sample values
+      let fieldType = 'text';
+      const samples = stats.samples;
+      
+      if (samples.length > 0) {
+        // Check if all non-empty samples are numeric
+        const numericSamples = samples.filter(v => {
+          const num = parseFloat(v);
+          return !isNaN(num) && typeof v === 'number';
+        });
+        
+        if (numericSamples.length > 0 && numericSamples.length === samples.length) {
+          // Check if values have decimal places
+          const hasDecimals = numericSamples.some(v => v % 1 !== 0);
+          fieldType = hasDecimals ? 'currency' : 'number';
+        }
+      }
+
+      return {
+        key: key,
+        label: formatFieldLabel(key),
+        type: fieldType,
+        sortable: true,
+        highlight: shouldHighlightField(key),
+        hidden: false,
+        displayOrder: 0
+      };
+    });
+
+    // Sort fields to match database column order (similar to finance controller)
+    fields.sort((a, b) => {
+      const aIndex = columnOrder.indexOf(a.key);
+      const bIndex = columnOrder.indexOf(b.key);
+      
+      // If both found, sort by their position in database
+      if (aIndex !== -1 && bIndex !== -1) {
+        return aIndex - bIndex;
+      }
+      // If only one found, prioritize it
+      if (aIndex !== -1) return -1;
+      if (bIndex !== -1) return 1;
+      // If neither found, alphabetical
+      return a.key.localeCompare(b.key);
+    });
+
+    // Add month_name and year fields right after the first field
+    const monthYearFields = [
+      {
+        key: 'month_name',
+        label: formatFieldLabel('month_name'),
+        type: 'text',
+        sortable: true,
+        highlight: shouldHighlightField('month_name'),
+        hidden: false,
+        displayOrder: 0
+      },
+      {
+        key: 'year',
+        label: formatFieldLabel('year'),
+        type: 'number',
+        sortable: true,
+        highlight: shouldHighlightField('year'),
+        hidden: false,
+        displayOrder: 0
+      }
+    ];
+
+    // Insert month_name and year after the first field
+    const allFields = [
+      fields[0],           // First field from database
+      ...monthYearFields,  // month_name and year
+      ...fields.slice(1)   // Rest of the fields
+    ];
+
     // Transform data - extract and flatten JSONB structure
     const payslips = payslipsResult.rows.map(row => ({
       id: row.id,
+      month_name: row.month_name,
+      year: row.year,
       created_at: row.created_at,
       updated_at: row.updated_at,
       ...row.data // Spread all JSONB data fields
     }));
 
     sendSuccess(res, {
-      payslips,
+      fields: allFields,
+      data: payslips,
       pagination: {
         page: parseInt(page),
         size: parseInt(size),
@@ -122,6 +250,8 @@ const getPayslipById = async (req, res) => {
 
     const payslip = {
       id: result.rows[0].id,
+      month_name: result.rows[0].month_name,
+      year: result.rows[0].year,
       ...result.rows[0].data,
       created_at: result.rows[0].created_at,
       updated_at: result.rows[0].updated_at
@@ -141,8 +271,8 @@ const createPayslip = async (req, res) => {
     const payslipData = req.body;
 
     // Basic validation
-    if (!payslipData.employee_id || !payslipData.employee_name || !payslipData.pay_period_start || !payslipData.pay_period_end || payslipData.basic_salary === undefined) {
-      return sendValidationError(res, 'Missing required fields for payslip creation');
+    if (!payslipData.employee_id || !payslipData.employee_name || !payslipData.pay_period_start || !payslipData.pay_period_end || payslipData.basic_salary === undefined || !payslipData.month_name || !payslipData.year) {
+      return sendValidationError(res, 'Missing required fields for payslip creation: employee_id, employee_name, pay_period_start, pay_period_end, basic_salary, month_name, year');
     }
 
     // Calculate gross and net salary if not provided
@@ -161,13 +291,15 @@ const createPayslip = async (req, res) => {
     payslipData.created_at = new Date().toISOString();
 
     const insertResult = await query(`
-      INSERT INTO payslips (data, created_at, updated_at)
-      VALUES ($1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      INSERT INTO payslips (data, month_name, year, created_at, updated_at)
+      VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
       RETURNING *
-    `, [JSON.stringify(payslipData)]);
+    `, [JSON.stringify(payslipData), payslipData.month_name || null, payslipData.year || null]);
 
     const payslip = {
       id: insertResult.rows[0].id,
+      month_name: insertResult.rows[0].month_name,
+      year: insertResult.rows[0].year,
       ...insertResult.rows[0].data,
       created_at: insertResult.rows[0].created_at,
       updated_at: insertResult.rows[0].updated_at
@@ -206,15 +338,34 @@ const updatePayslip = async (req, res) => {
       updatedData.net_salary = updatedData.gross_salary - totalDeductions;
     }
 
-    const updateResult = await query(`
+    // Prepare update query with month_name and year if provided
+    let updateQuery = `
       UPDATE payslips 
-      SET data = $1, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $2
-      RETURNING *
-    `, [JSON.stringify(updatedData), id]);
+      SET data = $1, updated_at = CURRENT_TIMESTAMP`;
+    let queryParams = [JSON.stringify(updatedData)];
+    let paramCount = 2;
+
+    if (updateData.month_name !== undefined) {
+      updateQuery += `, month_name = $${paramCount}`;
+      queryParams.push(updateData.month_name);
+      paramCount++;
+    }
+
+    if (updateData.year !== undefined) {
+      updateQuery += `, year = $${paramCount}`;
+      queryParams.push(updateData.year);
+      paramCount++;
+    }
+
+    updateQuery += ` WHERE id = $${paramCount} RETURNING *`;
+    queryParams.push(id);
+
+    const updateResult = await query(updateQuery, queryParams);
 
     const payslip = {
       id: updateResult.rows[0].id,
+      month_name: updateResult.rows[0].month_name,
+      year: updateResult.rows[0].year,
       ...updateResult.rows[0].data,
       created_at: updateResult.rows[0].created_at,
       updated_at: updateResult.rows[0].updated_at
@@ -258,26 +409,27 @@ const getPayslipsByEmployee = async (req, res) => {
     let paramCount = 2;
 
     if (year) {
-      whereClause += ` AND data->>'year' = $${paramCount}`;
+      whereClause += ` AND year = $${paramCount}`;
       params.push(year);
       paramCount++;
     }
 
     if (month) {
-      whereClause += ` AND data->>'month' = $${paramCount}`;
+      whereClause += ` AND month_name = $${paramCount}`;
       params.push(month);
       paramCount++;
     }
 
     const result = await query(`
-      SELECT id, data, created_at, updated_at
+      SELECT id, data, month_name, year, created_at, updated_at
       FROM payslips 
       ${whereClause}
-      ORDER BY data->>'pay_period_start' DESC
     `, params);
 
     const payslips = result.rows.map(row => ({
       id: row.id,
+      month_name: row.month_name,
+      year: row.year,
       ...row.data,
       created_at: row.created_at,
       updated_at: row.updated_at
@@ -296,12 +448,12 @@ const getPayslipSummary = async (req, res) => {
   try {
     const { year = new Date().getFullYear(), month = '' } = req.query;
 
-    let whereClause = "WHERE data->>'year' = $1";
+    let whereClause = "WHERE year = $1";
     const params = [year.toString()];
     let paramCount = 2;
 
     if (month) {
-      whereClause += ` AND data->>'month' = $${paramCount}`;
+      whereClause += ` AND month_name = $${paramCount}`;
       params.push(month);
       paramCount++;
     }
@@ -339,7 +491,7 @@ const getPayslipSummary = async (req, res) => {
     `, params);
 
     sendSuccess(res, {
-      period: month ? `${month}/${year}` : year.toString(),
+      period: month ? `${month} ${year}` : year.toString(),
       summary: summaryResult.rows[0],
       statusBreakdown: statusBreakdown.rows,
       departmentBreakdown: departmentBreakdown.rows
@@ -352,60 +504,44 @@ const getPayslipSummary = async (req, res) => {
 };
 
 // POST /api/admin/payslips/generate - Generate payslip from finance data
+// Expected request body: { Rick: "RICK001", month_name: "January", year: 2025 }
+// month_name should be the full month name (January, February, March, etc.)
 const generatePayslip = async (req, res) => {
   try {
-    const { rick, month, year } = req.body;
-
-    // Validation
-    if (!rick || !month || !year) {
-      return sendError(res, 'Missing required parameters: rick, month, year', 400);
-    }
-
-    // Validate month and year
-    const monthNum = parseInt(month);
-    const yearNum = parseInt(year);
-    
-    if (monthNum < 1 || monthNum > 12) {
-      return sendError(res, 'Invalid month. Must be between 1 and 12', 400);
-    }
-
-    if (yearNum < 2000 || yearNum > 2100) {
-      return sendError(res, 'Invalid year', 400);
-    }
+    const { Rick, month_name, year } = req.body;
 
     // Get driver information
     const driverResult = await query(
       'SELECT id, rick, name, mobile FROM drivers WHERE rick = $1',
-      [rick]
+      [Rick]
     );
 
     if (driverResult.rows.length === 0) {
-      return sendNotFound(res, 'Driver with rick ID');
+      return sendNotFound(res, 'Driver with Rick ID');
     }
 
     const driver = driverResult.rows[0];
 
     // Get finance records for the specific user, month, and year
-    const startDate = `${year}-${month.toString().padStart(2, '0')}-01`;
-    const endDate = new Date(yearNum, monthNum, 0).toISOString().split('T')[0]; // Last day of month
-
     const financeQuery = `
       SELECT 
         data,
         created_at
       FROM finance_records 
-      WHERE data->>'rick' = $1 
-      AND DATE_TRUNC('month', created_at) = $2
+      WHERE data->>'Rick' = $1 
+      AND month_name = $2
+      AND year = $3
       ORDER BY created_at ASC
     `;
     
-    const financeResult = await query(financeQuery, [rick, startDate]);
+    const financeResult = await query(financeQuery, [Rick, month_name, year.toString()]);
+    console.log("Finance result: === ", financeResult.rows);
 
     if (financeResult.rows.length === 0) {
-      return sendError(res, `No finance records found for rick ID ${rick} in ${month}/${year}`, 404);
+      return sendError(res, `No finance records found for Rick ID ${Rick} in ${month_name} ${year}`, 404);
     }
 
-    // Process finance data to calculate payslip
+    // Process finance data to create payslip array with CR/DR logic
     const financeData = financeResult.rows;
     
     try {
@@ -418,254 +554,81 @@ const generatePayslip = async (req, res) => {
         return isNaN(numValue) ? 0 : numValue;
       };
 
-      // Initialize all finance fields with totals
-      const monthlyTotals = {
-        // Earnings (DR - Debit/Positive amounts)
-        total_salary: 0,
-        employee: 0,
-        daman: 0,
-        darb: 0,
-        pos: 0,
-        adnoc: 0,
-        trip: 0,
-        other_exp: 0,
-        uber_30_days: 0,
-        careem_30_days: 0,
-        yango_30: 0,
-        
-        // Deductions (CR - Credit/Negative amounts)
-        fine: 0,
-        salik: 0,
-        advance: 0,
-        
-        // Net calculations
-        total_earnings: 0,
-        total_deductions: 0,
-        net_salary: 0
-      };
-
-      // Process each finance record and sum all fields
+      // Create payslip array from JSONB data
+      const payslipArray = [];
+      
+      // Process each finance record
       financeData.forEach(record => {
         const data = record.data;
         
-        // Debug logging
-        console.log('Processing finance record:', record.id, 'Data keys:', Object.keys(data || {}));
+        // Process each field in the finance record
+        Object.entries(data).forEach(([key, value]) => {
+          // Skip non-financial fields
+          if (['Rick', 'name', 'date', 'plate'].includes(key)) {
+            return;
+          }
+          
+          const numericValue = getNumericValue(data, key);
+          
+          // Skip zero values
+          if (numericValue === 0) {
+            return;
+          }
+          
+          // Create payslip entry
+          const payslipEntry = {
+            field: key,
+            amount: Math.abs(numericValue), // Always positive amount
+            type: numericValue < 0 ? 'CR' : 'DR' // Negative values = CR, Positive values = DR
+          };
+          
+          payslipArray.push(payslipEntry);
+        });
+      });
+
+      // Get opening balance (obopm) from payslips table
+      let obopm = 0; // Default opening balance
+      
+      try {
+        // Get the most recent payslip for this driver to get the closing balance as opening balance
+        const obopmQuery = `
+          SELECT data->>'obopm' as obopm
+          FROM payslips 
+          WHERE data->>'rick' = $1 
+          AND (year < $2 OR (year = $2 AND month_name < $3))
+          ORDER BY year DESC, month_name DESC
+          LIMIT 1
+        `;
         
-        // Sum all financial fields using safe helper function
-        Object.keys(monthlyTotals).forEach(key => {
-          const value = getNumericValue(data, key);
-          monthlyTotals[key] += value;
-          if (value !== 0) {
-            console.log(`Added ${key}: ${value} (total: ${monthlyTotals[key]})`);
-          }
-        });
-      });
-
-      // Calculate earnings (positive amounts)
-      const earnings = {
-        total_salary: monthlyTotals.total_salary,
-        employee: monthlyTotals.employee,
-        daman: monthlyTotals.daman,
-        darb: monthlyTotals.darb,
-        pos: monthlyTotals.pos,
-        adnoc: monthlyTotals.adnoc,
-        trip: monthlyTotals.trip,
-        other_exp: monthlyTotals.other_exp,
-        uber_30_days: monthlyTotals.uber_30_days,
-        careem_30_days: monthlyTotals.careem_30_days,
-        yango_30: monthlyTotals.yango_30
-      };
-
-      // Calculate deductions (negative amounts)
-      const deductions = {
-        fine: Math.abs(monthlyTotals.fine),
-        salik: Math.abs(monthlyTotals.salik),
-        advance: Math.abs(monthlyTotals.advance)
-      };
-
-      // Calculate totals
-      const totalEarnings = Object.values(earnings).reduce((sum, val) => sum + (val > 0 ? val : 0), 0);
-      const totalDeductions = Object.values(deductions).reduce((sum, val) => sum + val, 0);
-      const netSalary = totalEarnings - totalDeductions;
-
-    // Helper function to create earnings/deductions array
-    const createEarningsArray = (totals) => {
-      const earnings = [];
-      
-      // Add earnings with positive values
-      if (totals.total_salary > 0) {
-        earnings.push({
-          name: "Salary",
-          amount: totals.total_salary,
-          description: `Salary posted ${monthNum}-${year}`
-        });
-      }
-      if (totals.employee > 0) {
-        earnings.push({
-          name: "Employee",
-          amount: totals.employee,
-          description: `Employee payment for ${monthNum}-${year}`
-        });
-      }
-      if (totals.daman > 0) {
-        earnings.push({
-          name: "Daman",
-          amount: totals.daman,
-          description: `Daman payment for ${monthNum}-${year}`
-        });
-      }
-      if (totals.darb > 0) {
-        earnings.push({
-          name: "Darb",
-          amount: totals.darb,
-          description: `Darb payment for ${monthNum}-${year}`
-        });
-      }
-      if (totals.pos > 0) {
-        earnings.push({
-          name: "POS",
-          amount: totals.pos,
-          description: `POS payment for ${monthNum}-${year}`
-        });
-      }
-      if (totals.adnoc > 0) {
-        earnings.push({
-          name: "ADNOC",
-          amount: totals.adnoc,
-          description: `ADNOC payment for ${monthNum}-${year}`
-        });
-      }
-      if (totals.trip > 0) {
-        earnings.push({
-          name: "Trip",
-          amount: totals.trip,
-          description: `Trip payment for ${monthNum}-${year}`
-        });
-      }
-      if (totals.other_exp > 0) {
-        earnings.push({
-          name: "Other Expenses",
-          amount: totals.other_exp,
-          description: `Other expenses for ${monthNum}-${year}`
-        });
-      }
-      if (totals.uber_30_days > 0) {
-        earnings.push({
-          name: "UBER Payment",
-          amount: totals.uber_30_days,
-          description: `UBER Payment Received From 1st to 31 ${monthNum}-${year}`
-        });
-      }
-      if (totals.careem_30_days > 0) {
-        earnings.push({
-          name: "Careem Payment",
-          amount: totals.careem_30_days,
-          description: `Careem Payment Received From 1st to 31 ${monthNum}-${year}`
-        });
-      }
-      if (totals.yango_30 > 0) {
-        earnings.push({
-          name: "Yango Payment",
-          amount: totals.yango_30,
-          description: `Yango Payment Received From 1st to 31 ${monthNum}-${year}`
-        });
-      }
-      
-      return earnings;
-    };
-
-    const createDeductionsArray = (totals) => {
-      const deductions = [];
-      
-      // Add deductions with positive values
-      if (Math.abs(totals.fine) > 0) {
-        deductions.push({
-          name: "Fine",
-          amount: Math.abs(totals.fine),
-          description: `Fine charges for ${monthNum}-${year}`
-        });
-      }
-      if (Math.abs(totals.salik) > 0) {
-        deductions.push({
-          name: "Salik Charges",
-          amount: Math.abs(totals.salik),
-          description: `Salik Charges From 1 to 31-${monthNum}-${year}`
-        });
-      }
-      if (Math.abs(totals.advance) > 0) {
-        deductions.push({
-          name: "Advance",
-          amount: Math.abs(totals.advance),
-          description: `Advance deduction for ${monthNum}-${year}`
-        });
-      }
-      if (Math.abs(totals.employee) > 0) {
-        deductions.push({
-          name: "Employee",
-          amount: Math.abs(totals.employee),
-          description: "Employee"
-        });
-      }
-      if (Math.abs(totals.daman) > 0) {
-        deductions.push({
-          name: "Health Insurance",
-          amount: Math.abs(totals.daman),
-          description: `Health Insurance Month of ${monthNum}-${year}`
-        });
-      }
-      if (Math.abs(totals.darb) > 0) {
-        deductions.push({
-          name: "Darb Charges",
-          amount: Math.abs(totals.darb),
-          description: `Darb Charges From 1 to 31-${monthNum}-${year}`
-        });
-      }
-      
-      return deductions;
-    };
-
-    // Get plate number from first finance record if available
-    const firstRecord = financeData[0];
-    const plateNumber = firstRecord && firstRecord.data && firstRecord.data.plate ? 
-      firstRecord.data.plate.toString() : 'N/A';
-
-    // Create payslip data in the desired format
-    const payslipData = {
-      driver_name: driver.name,
-      rick: rick,
-      plate: plateNumber,
-      mobile_no: driver.mobile,
-      opening_balance: 0, // You can calculate this based on your business logic
-      monthly_deductions: createDeductionsArray(monthlyTotals),
-      monthly_earnings: createEarningsArray(monthlyTotals)
-    };
-
-      // Extract any additional dynamic fields from finance records
-      const allDynamicFields = new Set();
-      financeData.forEach(record => {
-        Object.keys(record.data).forEach(key => {
-          if (!['rick', 'name', 'date'].includes(key)) {
-            allDynamicFields.add(key);
-          }
-        });
-      });
-      console.log("All fields: === ",  allDynamicFields);
-
-      // Add dynamic fields to payslip data
-      allDynamicFields.forEach(field => {
-        if(payslipData.allowances !== undefined){
-          if (!payslipData.allowances[field] && !payslipData.deductions[field]) {
-            payslipData.dynamic_fields[field] = 0; // Default value for fields not in earnings/deductions
-          }
+        const obopmResult = await query(obopmQuery, [Rick, year.toString(), month_name]);
+        
+        if (obopmResult.rows.length > 0 && obopmResult.rows[0].obopm) {
+          obopm = parseFloat(obopmResult.rows[0].obopm) || 0;
         }
-      });
+        
+        console.log(`Opening balance (obopm) for ${Rick}: ${obopm}`);
+        
+      } catch (obopmError) {
+        console.error('Error fetching opening balance:', obopmError);
+        // Keep default value of 0 if there's an error
+      }
 
-      // Insert the generated payslip as JSON
-      const insertResult = await query(`
-        INSERT INTO payslips (data, created_at, updated_at)
-        VALUES ($1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        RETURNING *
-      `, [JSON.stringify(payslipData)]);
+      // Get plate number from first finance record if available
+      const firstRecord = financeData[0];
+      const plateNumber = firstRecord && firstRecord.data && firstRecord.data.plate ? 
+        firstRecord.data.plate.toString() : 'N/A';
+
+      console.log("RickRick === ", Rick);
+
+      // Create payslip data in the desired format
+      const payslipData = {
+        driver_name: driver.name,
+        rick: Rick,
+        plate: plateNumber,
+        mobile_no: driver.mobile,
+        obopm: obopm, // Opening balance
+        payslip_array: payslipArray // Array with CR/DR logic
+      };
 
     sendSuccess(res, {
       payslip: payslipData
@@ -681,18 +644,90 @@ const generatePayslip = async (req, res) => {
     }
 };
 
-// GET /api/admin/payslips/generate/:rick/:month/:year - Generate payslip with URL params
-const generatePayslipByParams = async (req, res) => {
+// POST /api/admin/payslips/insert - Insert generated payslip to database
+// Expected request body: { driver_name: "...", rick: "...", month_name: "January", year: 2025, ... }
+const insertPayslip = async (req, res) => {
   try {
-    const { rick, month, year } = req.params;
+    const { month_name, year } = req.body;
 
-    // Use the same logic as generatePayslip but with URL parameters
-    req.body = { rick, month, year };
-    return await generatePayslip(req, res);
+    // Basic validation
+    if (!month_name || !year) {
+      return sendValidationError(res, 'Missing required fields: month_name, year');
+    }
+
+    // Extract payslip data (everything except month_name and year)
+    const payslipData = { ...req.body };
+    delete payslipData.month_name;
+    delete payslipData.year;
+
+    // Insert the generated payslip as JSON
+    const insertResult = await query(`
+      INSERT INTO payslips (data, month_name, year, created_at, updated_at)
+      VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      RETURNING *
+    `, [JSON.stringify(payslipData), month_name, year.toString()]);
+
+    const payslip = {
+      id: insertResult.rows[0].id,
+      month_name: insertResult.rows[0].month_name,
+      year: insertResult.rows[0].year,
+      ...insertResult.rows[0].data,
+      created_at: insertResult.rows[0].created_at,
+      updated_at: insertResult.rows[0].updated_at
+    };
+
+    sendSuccess(res, payslip, 'Payslip inserted successfully', 201);
 
   } catch (error) {
-    console.error('Error generating payslip by params:', error);
-    sendError(res, 'Failed to generate payslip', 500, error);
+    console.error('Error inserting payslip:', error);
+    sendError(res, 'Failed to insert payslip', 500, error);
+  }
+};
+
+// POST /api/admin/payslips/update - Update payslip (frontend handles duplicate checking)
+// Expected request body: { driver_name: "...", rick: "...", month_name: "January", year: 2025, ... }
+const updatePayslipData = async (req, res) => {
+  try {
+    const { month_name, year, rick } = req.body;
+
+    // Basic validation
+    if (!month_name || !year || !rick) {
+      return sendValidationError(res, 'Missing required fields: month_name, year, rick');
+    }
+
+    // Extract payslip data (everything except month_name and year)
+    const payslipData = { ...req.body };
+    delete payslipData.month_name;
+    delete payslipData.year;
+
+    // Update existing payslip
+    const updateResult = await query(`
+      UPDATE payslips 
+      SET data = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE data->>'rick' = $2 
+      AND month_name = $3 
+      AND year = $4
+      RETURNING *
+    `, [JSON.stringify(payslipData), rick, month_name, year.toString()]);
+
+    if (updateResult.rows.length === 0) {
+      return sendNotFound(res, 'Payslip not found for update');
+    }
+
+    const payslip = {
+      id: updateResult.rows[0].id,
+      month_name: updateResult.rows[0].month_name,
+      year: updateResult.rows[0].year,
+      ...updateResult.rows[0].data,
+      created_at: updateResult.rows[0].created_at,
+      updated_at: updateResult.rows[0].updated_at
+    };
+
+    sendSuccess(res, payslip, 'Payslip updated successfully');
+
+  } catch (error) {
+    console.error('Error updating payslip:', error);
+    sendError(res, 'Failed to update payslip', 500, error);
   }
 };
 
@@ -705,5 +740,6 @@ module.exports = {
   getPayslipsByEmployee,
   getPayslipSummary,
   generatePayslip,
-  generatePayslipByParams
+  insertPayslip,
+  updatePayslipData
 };

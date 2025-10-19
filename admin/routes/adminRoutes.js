@@ -35,7 +35,8 @@ router.delete('/payslips/:id', requirePermission('payslips.delete'), payslipCont
 router.get('/payslips/employee/:employee_id', requirePermission('payslips.view'), payslipController.getPayslipsByEmployee);
 router.get('/payslips/summary', requirePermission('payslips.view'), payslipController.getPayslipSummary);
 router.post('/payslips/generate', requirePermission('payslips.generate'), payslipController.generatePayslip);
-router.get('/payslips/generate/:rick/:month/:year', requirePermission('payslips.generate'), payslipController.generatePayslipByParams);
+router.post('/payslips/insert', requirePermission('payslips.create'), payslipController.insertPayslip);
+router.post('/payslips/update', requirePermission('payslips.update'), payslipController.updatePayslipData);
 
 // Driver routes (protected)
 router.get('/drivers', requirePermission('drivers.view'), driverController.getAllDrivers);

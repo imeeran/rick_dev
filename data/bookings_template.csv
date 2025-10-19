@@ -1,0 +1,4 @@
+Car Type,Pickup Location,Drop Location,Booking Date,Booking Time,Guest Name,Mobile Number,Email,Special Note,Assigned Driver,Status
+BMW 7 Series,123 Main St Dubai,456 Sheikh Zayed Road Dubai,2025-10-15,14:30,John Doe,+971501234567,john.doe@example.com,Please call upon arrival,Driver 1,pending
+Mercedes S-Class,789 JBR Dubai,321 Downtown Dubai,2025-10-16,10:00,Jane Smith,+971501234568,jane.smith@example.com,Airport pickup,,pending
+Audi A8,555 Palm Jumeirah,777 Business Bay,2025-10-17,09:30,Bob Johnson,+971501234569,bob.johnson@example.com,Business meeting,Driver 2,confirmed
