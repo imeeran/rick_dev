@@ -101,6 +101,7 @@ const getAllPayslips = async (req, res) => {
         data,
         month_name,
         year,
+        obopm,
         created_at,
         updated_at
       FROM payslips
@@ -213,6 +214,7 @@ const getAllPayslips = async (req, res) => {
       id: row.id,
       month_name: row.month_name,
       year: row.year,
+      obopm: row.obopm,
       created_at: row.created_at,
       updated_at: row.updated_at,
       ...row.data // Spread all JSONB data fields
@@ -252,6 +254,7 @@ const getPayslipById = async (req, res) => {
       id: result.rows[0].id,
       month_name: result.rows[0].month_name,
       year: result.rows[0].year,
+      obopm: result.rows[0].obopm,
       ...result.rows[0].data,
       created_at: result.rows[0].created_at,
       updated_at: result.rows[0].updated_at
@@ -421,7 +424,7 @@ const getPayslipsByEmployee = async (req, res) => {
     }
 
     const result = await query(`
-      SELECT id, data, month_name, year, created_at, updated_at
+      SELECT id, data, month_name, year, obopm, created_at, updated_at
       FROM payslips 
       ${whereClause}
     `, params);
@@ -430,6 +433,7 @@ const getPayslipsByEmployee = async (req, res) => {
       id: row.id,
       month_name: row.month_name,
       year: row.year,
+      obopm: row.obopm,
       ...row.data,
       created_at: row.created_at,
       updated_at: row.updated_at
@@ -588,26 +592,45 @@ const generatePayslip = async (req, res) => {
 
       // Get opening balance (obopm) from payslips table
       let obopm = 0; // Default opening balance
-      
+
       try {
-        // Get the most recent payslip for this driver to get the closing balance as opening balance
+        // Compute previous month and year from provided month_name/year
+        const months = [
+          'January','February','March','April','May','June','July','August','September','October','November','December'
+        ];
+        const currentIndex = months.findIndex(m => m.toLowerCase() === (month_name || '').toLowerCase());
+        let prevMonthName = month_name;
+        let prevYear = parseInt(year, 10);
+        if (currentIndex !== -1) {
+          if (currentIndex === 0) {
+            prevMonthName = 'December';
+            prevYear = prevYear - 1;
+          } else {
+            prevMonthName = months[currentIndex - 1];
+          }
+        }
+
+        // Fetch obopm for the exact previous period
         const obopmQuery = `
-          SELECT data->>'obopm' as obopm
-          FROM payslips 
-          WHERE data->>'rick' = $1 
-          AND (year < $2 OR (year = $2 AND month_name < $3))
-          ORDER BY year DESC, month_name DESC
+          SELECT obopm
+          FROM payslips
+          WHERE data->>'rick' = $1
+            AND year = $2
+            AND month_name = $3
+          ORDER BY updated_at DESC
           LIMIT 1
         `;
-        
-        const obopmResult = await query(obopmQuery, [Rick, year.toString(), month_name]);
-        
-        if (obopmResult.rows.length > 0 && obopmResult.rows[0].obopm) {
+
+        const obopmResult = await query(obopmQuery, [Rick, prevYear, prevMonthName]);
+
+        if (obopmResult.rows.length > 0 && obopmResult.rows[0].obopm !== undefined && obopmResult.rows[0].obopm !== null) {
           obopm = parseFloat(obopmResult.rows[0].obopm) || 0;
+        } else {
+          obopm = 0;
         }
-        
-        console.log(`Opening balance (obopm) for ${Rick}: ${obopm}`);
-        
+
+        console.log(`Opening balance (obopm) for ${Rick} for ${prevMonthName} ${prevYear}: ${obopm}`);
+
       } catch (obopmError) {
         console.error('Error fetching opening balance:', obopmError);
         // Keep default value of 0 if there's an error
@@ -645,32 +668,37 @@ const generatePayslip = async (req, res) => {
 };
 
 // POST /api/admin/payslips/insert - Insert generated payslip to database
-// Expected request body: { driver_name: "...", rick: "...", month_name: "January", year: 2025, ... }
+// Expected request body: { driver_name: "...", rick: "...", month_name: "January", year: 2025, obopm: 1000, ... }
 const insertPayslip = async (req, res) => {
   try {
-    const { month_name, year } = req.body;
+    const { month_name, year, obopm } = req.body;
 
     // Basic validation
     if (!month_name || !year) {
       return sendValidationError(res, 'Missing required fields: month_name, year');
     }
 
-    // Extract payslip data (everything except month_name and year)
+    // Extract payslip data (everything except month_name, year, and obopm)
     const payslipData = { ...req.body };
     delete payslipData.month_name;
     delete payslipData.year;
+    delete payslipData.obopm;
 
-    // Insert the generated payslip as JSON
+    // Convert obopm to decimal, default to 0 if not provided
+    const obopmValue = obopm ? parseFloat(obopm) : 0;
+
+    // Insert the generated payslip as JSON with separate obopm column
     const insertResult = await query(`
-      INSERT INTO payslips (data, month_name, year, created_at, updated_at)
-      VALUES ($1, $2, $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      INSERT INTO payslips (data, month_name, year, obopm, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
       RETURNING *
-    `, [JSON.stringify(payslipData), month_name, year.toString()]);
+    `, [JSON.stringify(payslipData), month_name, year.toString(), obopmValue]);
 
     const payslip = {
       id: insertResult.rows[0].id,
       month_name: insertResult.rows[0].month_name,
       year: insertResult.rows[0].year,
+      obopm: insertResult.rows[0].obopm,
       ...insertResult.rows[0].data,
       created_at: insertResult.rows[0].created_at,
       updated_at: insertResult.rows[0].updated_at
@@ -685,30 +713,34 @@ const insertPayslip = async (req, res) => {
 };
 
 // POST /api/admin/payslips/update - Update payslip (frontend handles duplicate checking)
-// Expected request body: { driver_name: "...", rick: "...", month_name: "January", year: 2025, ... }
+// Expected request body: { driver_name: "...", rick: "...", month_name: "January", year: 2025, obopm: 1000, ... }
 const updatePayslipData = async (req, res) => {
   try {
-    const { month_name, year, rick } = req.body;
+    const { month_name, year, rick, obopm } = req.body;
 
     // Basic validation
     if (!month_name || !year || !rick) {
       return sendValidationError(res, 'Missing required fields: month_name, year, rick');
     }
 
-    // Extract payslip data (everything except month_name and year)
+    // Extract payslip data (everything except month_name, year, and obopm)
     const payslipData = { ...req.body };
     delete payslipData.month_name;
     delete payslipData.year;
+    delete payslipData.obopm;
 
-    // Update existing payslip
+    // Convert obopm to decimal, default to 0 if not provided
+    const obopmValue = obopm ? parseFloat(obopm) : 0;
+
+    // Update existing payslip with separate obopm column
     const updateResult = await query(`
       UPDATE payslips 
-      SET data = $1, updated_at = CURRENT_TIMESTAMP
-      WHERE data->>'rick' = $2 
-      AND month_name = $3 
-      AND year = $4
+      SET data = $1, obopm = $2, updated_at = CURRENT_TIMESTAMP
+      WHERE data->>'rick' = $3 
+      AND month_name = $4 
+      AND year = $5
       RETURNING *
-    `, [JSON.stringify(payslipData), rick, month_name, year.toString()]);
+    `, [JSON.stringify(payslipData), obopmValue, rick, month_name, year.toString()]);
 
     if (updateResult.rows.length === 0) {
       return sendNotFound(res, 'Payslip not found for update');
@@ -718,6 +750,7 @@ const updatePayslipData = async (req, res) => {
       id: updateResult.rows[0].id,
       month_name: updateResult.rows[0].month_name,
       year: updateResult.rows[0].year,
+      obopm: updateResult.rows[0].obopm,
       ...updateResult.rows[0].data,
       created_at: updateResult.rows[0].created_at,
       updated_at: updateResult.rows[0].updated_at
