@@ -210,14 +210,63 @@ const getAllPayslips = async (req, res) => {
     ];
 
     // Transform data - extract and flatten JSONB structure
-    const payslips = payslipsResult.rows.map(row => ({
-      id: row.id,
-      month_name: row.month_name,
-      year: row.year,
-      obopm: row.obopm,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      ...row.data // Spread all JSONB data fields
+    const payslips = await Promise.all(payslipsResult.rows.map(async (row) => {
+      // Calculate obopm (opening balance of previous month)
+      let obopm = 0; // Default value
+      
+      try {
+        // Get the Rick ID from the data
+        const rickId = row.data?.rick;
+        
+        if (rickId) {
+          // Calculate previous month and year
+          const months = [
+            'January','February','March','April','May','June','July','August','September','October','November','December'
+          ];
+          const currentIndex = months.findIndex(m => m.toLowerCase() === (row.month_name || '').toLowerCase());
+          let prevMonthName = row.month_name;
+          let prevYear = parseInt(row.year, 10);
+          
+          if (currentIndex !== -1) {
+            if (currentIndex === 0) {
+              prevMonthName = 'December';
+              prevYear = prevYear - 1;
+            } else {
+              prevMonthName = months[currentIndex - 1];
+            }
+          }
+
+          // Fetch obopm for the exact previous period
+          const obopmQuery = `
+            SELECT obopm
+            FROM payslips
+            WHERE data->>'rick' = $1
+              AND year = $2
+              AND month_name = $3
+            ORDER BY updated_at DESC
+            LIMIT 1
+          `;
+
+          const obopmResult = await query(obopmQuery, [rickId, prevYear, prevMonthName]);
+
+          if (obopmResult.rows.length > 0 && obopmResult.rows[0].obopm !== undefined && obopmResult.rows[0].obopm !== null) {
+            obopm = parseFloat(obopmResult.rows[0].obopm) || 0;
+          }
+        }
+      } catch (obopmError) {
+        console.error('Error fetching opening balance:', obopmError);
+        // Keep default value of 0 if there's an error
+      }
+
+      return {
+        id: row.id,
+        month_name: row.month_name,
+        year: row.year,
+        obopm: obopm, // Use calculated obopm instead of stored value
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        ...row.data // Spread all JSONB data fields
+      };
     }));
 
     sendSuccess(res, {

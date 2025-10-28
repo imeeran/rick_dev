@@ -1,5 +1,6 @@
 const { query, pool } = require('../../shared/database/connection');
 const { sendSuccess, sendError, sendNotFound, sendValidationError } = require('../../shared/utils/response');
+const { ensureSuperadminPermissions } = require('../../shared/middleware/superadminPermissions');
 
 /**
  * Roles Controller
@@ -320,6 +321,9 @@ const assignPermissionsToRole = async (req, res) => {
 
       await client.query('COMMIT');
 
+      // Ensure superadmin has all permissions after any permission changes
+      await ensureSuperadminPermissions();
+
       // Get updated permissions
       const permissionsResult = await query(
         `SELECT p.* FROM permissions p
@@ -385,6 +389,45 @@ const getUsersByRole = async (req, res) => {
   }
 };
 
+// GET /api/admin/superadmin/permissions/status - Get superadmin permission status
+const getSuperadminPermissionStatus = async (req, res) => {
+  try {
+    const { getSuperadminPermissionStatus } = require('../../shared/middleware/superadminPermissions');
+    
+    const result = await getSuperadminPermissionStatus();
+    
+    if (result.success) {
+      sendSuccess(res, result.data, 'Superadmin permission status retrieved successfully');
+    } else {
+      sendError(res, result.message, 500, result.error);
+    }
+
+  } catch (error) {
+    console.error('Error getting superadmin permission status:', error);
+    sendError(res, 'Failed to get superadmin permission status', 500, error);
+  }
+};
+
+// POST /api/admin/superadmin/permissions/fix - Fix superadmin permissions
+const fixSuperadminPermissions = async (req, res) => {
+  try {
+    const result = await ensureSuperadminPermissions();
+    
+    if (result.success) {
+      sendSuccess(res, {
+        message: result.message,
+        permissionsGranted: result.permissionsGranted
+      }, 'Superadmin permissions fixed successfully');
+    } else {
+      sendError(res, result.message, 500, result.error);
+    }
+
+  } catch (error) {
+    console.error('Error fixing superadmin permissions:', error);
+    sendError(res, 'Failed to fix superadmin permissions', 500, error);
+  }
+};
+
 module.exports = {
   getAllRoles,
   getRoleById,
@@ -393,5 +436,7 @@ module.exports = {
   deleteRole,
   getAllPermissions,
   assignPermissionsToRole,
-  getUsersByRole
+  getUsersByRole,
+  getSuperadminPermissionStatus,
+  fixSuperadminPermissions
 };

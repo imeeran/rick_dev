@@ -31,4 +31,8 @@ router.get('/permissions', authenticate, requireAdmin(), rolesController.getAllP
 router.post('/roles/:id/permissions', authenticate, requireSuperAdmin(), rolesController.assignPermissionsToRole);
 router.get('/roles/:id/users', authenticate, requireAdmin(), rolesController.getUsersByRole);
 
+// Superadmin permission management routes (superadmin only)
+router.get('/superadmin/permissions/status', authenticate, requireSuperAdmin(), rolesController.getSuperadminPermissionStatus);
+router.post('/superadmin/permissions/fix', authenticate, requireSuperAdmin(), rolesController.fixSuperadminPermissions);
+
 module.exports = router;
